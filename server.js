@@ -13,10 +13,10 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, maxPayload: 2 * 1024 * 1024 });
 
-// Health check
+// Health check (use this for Render health check / uptime pinger)
 app.get('/health', (req, res) => res.send('ok'));
 
-// Web Stream, Gesture Detection & Recording UI Page
+// Web Stream & Recording UI Page
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -133,7 +133,7 @@ app.get('/', (req, res) => {
             const osc = audioCtx.createOscillator();
             const gain = audioCtx.createGain();
             osc.type = 'sawtooth';
-            osc.frequency.setValueAtTime(880, audioCtx.currentTime); // 880Hz Siren frequency
+            osc.frequency.setValueAtTime(880, audioCtx.currentTime);
             gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
             gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.4);
             
@@ -151,7 +151,7 @@ app.get('/', (req, res) => {
 
         // --- MediaPipe Hands AI Setup ---
         const hands = new Hands({
-          locateFile: (file) => \`https://cdn.jsdelivr.net/npm/@mediapipe/hands/\${file}\`
+          locateFile: (file) => 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/' + file
         });
         hands.setOptions({
           maxNumHands: 1,
@@ -162,11 +162,7 @@ app.get('/', (req, res) => {
 
         hands.onResults(onHandResults);
 
-        let currentImage = null;
-
         function classifyGesture(landmarks) {
-          // Landmarks: 4=Thumb tip, 8=Index tip, 12=Middle tip, 16=Ring tip, 20=Pinky tip
-          // Joint bases: 2=Thumb IP, 6=Index PIP, 10=Middle PIP, 14=Ring PIP, 18=Pinky PIP
           const indexUp = landmarks[8].y < landmarks[6].y;
           const middleUp = landmarks[12].y < landmarks[10].y;
           const ringUp = landmarks[16].y < landmarks[14].y;
@@ -186,12 +182,10 @@ app.get('/', (req, res) => {
         }
 
         function onHandResults(results) {
-          if (!currentImage) return;
-          
           ctx.save();
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          ctx.drawImage(currentImage, 0, 0, canvas.width, canvas.height);
-
+          // We DO NOT clear the canvas here, because the video frame is the background.
+          // Just draw AI landmarks on top of the existing video frame.
+          
           if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
             for (const landmarks of results.multiHandLandmarks) {
               drawConnectors(ctx, landmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 3 });
@@ -249,7 +243,7 @@ app.get('/', (req, res) => {
             setTimeout(connect, 3000);
           };
 
-          ws.onmessage = async (event) => {
+          ws.onmessage = (event) => {
             if (typeof event.data === 'string') {
               if (event.data === 'DEVICE:1') {
                 setCam('Camera: ONLINE', 'status-online');
@@ -260,16 +254,25 @@ app.get('/', (req, res) => {
               return;
             }
             
+            // --- FIX: Video is drawn instantly, AI runs in background ---
             const blob = new Blob([event.data], { type: 'image/jpeg' });
             const url = URL.createObjectURL(blob);
             const img = new Image();
-            img.onload = async () => {
+            
+            img.onload = () => {
               if (canvas.width !== img.width || canvas.height !== img.height) {
                 canvas.width = img.width;
                 canvas.height = img.height;
               }
-              currentImage = img;
-              await hands.send({ image: img });
+              
+              // 1. Draw image to canvas IMMEDIATELY
+              ctx.drawImage(img, 0, 0);
+              
+              // 2. Send image to AI without blocking the video
+              if (typeof hands !== 'undefined') {
+                hands.send({ image: img }).catch(e => console.log("AI detection processing..."));
+              }
+              
               URL.revokeObjectURL(url);
             };
             img.src = url;
@@ -354,8 +357,14 @@ const viewers = new Set();
 function send(ws, msg) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
-function notifyDevice() { send(device, viewers.size > 0 ? 'STREAM:1' : 'STREAM:0'); }
-function notifyViewers() { viewers.forEach((v) => send(v, device ? 'DEVICE:1' : 'DEVICE:0')); }
+
+function notifyDevice() { 
+  send(device, viewers.size > 0 ? 'STREAM:1' : 'STREAM:0'); 
+}
+
+function notifyViewers() { 
+  viewers.forEach((v) => send(v, device ? 'DEVICE:1' : 'DEVICE:0')); 
+}
 
 wss.on('connection', (ws) => {
   ws.role = null;
@@ -368,6 +377,7 @@ wss.on('connection', (ws) => {
     if (!ws.role) {
       if (isBinary) return ws.close(1008, 'auth required');
       const msg = data.toString();
+      
       if (msg === 'DEVICE:' + DEVICE_KEY) {
         ws.role = 'device';
         if (device && device !== ws) device.terminate();
